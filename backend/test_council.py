@@ -3,6 +3,7 @@ import unittest
 from backend.council import (
     DEFAULT_SEATS,
     AgentAnalysis,
+    AgentDiscussion,
     CommanderOption,
     CouncilMeeting,
     MeetingState,
@@ -25,7 +26,7 @@ def ready_for_voting() -> CouncilMeeting:
         meeting.submit_analysis(
             AgentAnalysis(
                 agent_id=seat,
-                recommendation="Proceed with caution",
+                recommendation="YES",
                 reasoning="The route is available in the provided mission brief.",
                 facts=("The route is listed in the mission brief.",),
                 assumptions=("The brief remains current.",),
@@ -36,11 +37,97 @@ def ready_for_voting() -> CouncilMeeting:
             )
         )
     meeting.start_discussion()
+    for round_number in range(1, meeting.max_discussion_rounds + 1):
+        if round_number > 1:
+            meeting.start_next_discussion_round()
+        for seat in DEFAULT_SEATS:
+            meeting.submit_discussion(
+                AgentDiscussion(
+                    agent_id=seat,
+                    challenges="No new material challenge.",
+                    reconsideration="Recommendation remains supported.",
+                    recommendation_changed=False,
+                    updated_recommendation="YES",
+                    reasoning="The supplied analysis remains adequate.",
+                    confidence=0.7,
+                    round_number=round_number,
+                )
+            )
     meeting.start_initial_voting()
     return meeting
 
 
 class CouncilMeetingTests(unittest.TestCase):
+    def test_discussion_rounds_are_complete_bounded_and_append_only(self) -> None:
+        mission = MissionState("mission-2", "Training", "Review the route")
+        meeting = CouncilMeeting(
+            "Review the route",
+            mission_snapshot=mission.snapshot,
+            max_discussion_rounds=2,
+        )
+        meeting.start()
+        meeting.start_analysis()
+        for seat in DEFAULT_SEATS[:2]:
+            meeting.submit_analysis(
+                AgentAnalysis(
+                    agent_id=seat,
+                    recommendation="YES",
+                    reasoning="The supplied objective is clear.",
+                    facts=("The objective is present.",),
+                    assumptions=(),
+                    main_risks="Conditions may change.",
+                    missing_information="Current conditions.",
+                    suggested_improvements="Confirm conditions.",
+                    confidence=0.6,
+                )
+            )
+        meeting.start_discussion()
+        first_round = AgentDiscussion(
+            agent_id=DEFAULT_SEATS[0],
+            challenges="No additional challenge.",
+            reconsideration="Recommendation remains YES.",
+            recommendation_changed=False,
+            updated_recommendation="YES",
+            reasoning="No contrary evidence was provided.",
+            confidence=0.6,
+        )
+        meeting.submit_discussion(first_round)
+        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+            meeting.start_next_discussion_round()
+        with self.assertRaisesRegex(ValueError, "already submitted"):
+            meeting.submit_discussion(first_round)
+        meeting.submit_discussion(
+            AgentDiscussion(
+                agent_id=DEFAULT_SEATS[1],
+                challenges="No additional challenge.",
+                reconsideration="Recommendation remains NO.",
+                recommendation_changed=False,
+                updated_recommendation="NO",
+                reasoning="The concern remains unresolved.",
+                confidence=0.6,
+            )
+        )
+        meeting.start_next_discussion_round()
+        self.assertEqual(meeting.discussion_round, 2)
+        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+            meeting.start_initial_voting()
+        for seat, choice in zip(DEFAULT_SEATS[:2], ("YES", "NO")):
+            meeting.submit_discussion(
+                AgentDiscussion(
+                    agent_id=seat,
+                    challenges="No new information.",
+                    reconsideration="Maintain the recommendation.",
+                    recommendation_changed=False,
+                    updated_recommendation=choice,
+                    reasoning="The supplied material has not changed.",
+                    confidence=0.6,
+                    round_number=2,
+                )
+            )
+        meeting.start_initial_voting()
+        self.assertEqual(len(meeting.discussions), 4)
+        self.assertTrue(meeting.unresolved_disagreements)
+
     def test_motion_and_independent_analyses_are_recorded(self) -> None:
         mission = MissionState("mission-1", "Training", "Secure the objective")
         meeting = CouncilMeeting(
@@ -51,7 +138,7 @@ class CouncilMeetingTests(unittest.TestCase):
         analyses = [
             AgentAnalysis(
                 agent_id=seat,
-                recommendation=f"Recommendation from {seat}",
+                recommendation="YES",
                 reasoning="Based on the supplied mission information.",
                 facts=("The objective is listed in the mission brief.",),
                 assumptions=("The mission brief is current.",),
@@ -92,6 +179,15 @@ class CouncilMeetingTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires an explanation"):
             meeting.revise_vote(DEFAULT_SEATS[0], VoteChoice.YES, "  ")
+        self.assertEqual(meeting.vote_history, (initial,))
+        with self.assertRaisesRegex(ValueError, "no initial vote"):
+            meeting.revise_vote(
+                DEFAULT_SEATS[1], VoteChoice.YES, "There was no initial vote."
+            )
+        with self.assertRaisesRegex(ValueError, "must change"):
+            meeting.revise_vote(
+                DEFAULT_SEATS[0], VoteChoice.NO, "This does not change the vote."
+            )
         self.assertEqual(meeting.vote_history, (initial,))
 
         meeting.revise_vote(
@@ -146,7 +242,7 @@ class CouncilMeetingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "confidence"):
             AgentAnalysis(
                 agent_id=DEFAULT_SEATS[0],
-                recommendation="Proceed",
+                recommendation="YES",
                 reasoning="Reasoning",
                 facts=(),
                 assumptions=(),

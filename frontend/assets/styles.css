@@ -116,6 +116,21 @@ label small,
   padding: 1.25rem clamp(1rem, 3vw, 2.5rem) 3rem;
 }
 
+.login-shell {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 1rem;
+}
+
+.login-panel {
+  width: min(440px, 100%);
+}
+
+.login-panel h1 {
+  margin-top: 0;
+}
+
 .topbar {
   display: flex;
   justify-content: space-between;

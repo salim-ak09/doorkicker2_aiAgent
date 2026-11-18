@@ -1,6 +1,7 @@
 """Provider-independent council workflow and voting rules."""
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from types import MappingProxyType
 from typing import Mapping
@@ -48,15 +49,31 @@ class AgentAnalysis:
     missing_information: str
     suggested_improvements: str
     confidence: float
+    supporting_evidence: tuple[str, ...] = ()
+    main_concerns: tuple[str, ...] = ()
+    alternative_recommendations: tuple[str, ...] = ()
+    provider: str = "unknown"
+    model: str = "unknown"
+    response_type: str = "real_ai"
+    completed_at: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.agent_id, str) or not self.agent_id.strip():
             raise ValueError("agent_id must not be empty")
-        if not self.recommendation.strip():
-            raise ValueError("recommendation must not be empty")
+        if self.response_type == "legacy":
+            if not isinstance(self.recommendation, str) or not self.recommendation.strip():
+                raise ValueError("legacy recommendation must not be empty")
+        elif self.recommendation not in ("YES", "NO"):
+            raise ValueError("recommendation must be YES or NO")
         if not self.reasoning.strip():
             raise ValueError("reasoning must not be empty")
-        for field_name in ("facts", "assumptions"):
+        for field_name in (
+            "facts",
+            "assumptions",
+            "supporting_evidence",
+            "main_concerns",
+            "alternative_recommendations",
+        ):
             values = getattr(self, field_name)
             if not isinstance(values, tuple) or any(
                 not isinstance(value, str) or not value.strip()
@@ -69,6 +86,7 @@ class AgentAnalysis:
             or not 0.0 <= self.confidence <= 1.0
         ):
             raise ValueError("confidence must be between 0 and 1")
+        _validate_provenance(self.provider, self.model, self.response_type)
 
 
 @dataclass(frozen=True)
@@ -88,6 +106,17 @@ class AgentDiscussion:
     updated_recommendation: str
     reasoning: str
     confidence: float
+    round_number: int = 1
+    agreement: str = "Not stated"
+    disagreement: str = "Not stated"
+    weak_reasoning: str = "Not stated"
+    missing_information: str = "Not stated"
+    possible_risks: str = "Not stated"
+    unresolved_disagreements: tuple[str, ...] = ()
+    provider: str = "unknown"
+    model: str = "unknown"
+    response_type: str = "real_ai"
+    completed_at: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.agent_id, str) or not self.agent_id.strip():
@@ -97,6 +126,11 @@ class AgentDiscussion:
             "reconsideration",
             "updated_recommendation",
             "reasoning",
+            "agreement",
+            "disagreement",
+            "weak_reasoning",
+            "missing_information",
+            "possible_risks",
         ):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip():
@@ -109,6 +143,32 @@ class AgentDiscussion:
             or not 0.0 <= self.confidence <= 1.0
         ):
             raise ValueError("confidence must be between 0 and 1")
+        if (
+            isinstance(self.round_number, bool)
+            or not isinstance(self.round_number, int)
+            or self.round_number < 1
+        ):
+            raise ValueError("round_number must be a positive integer")
+        if not isinstance(self.unresolved_disagreements, tuple) or any(
+            not isinstance(value, str) or not value.strip()
+            for value in self.unresolved_disagreements
+        ):
+            raise ValueError("unresolved_disagreements must contain non-empty strings")
+        _validate_provenance(self.provider, self.model, self.response_type)
+        if self.response_type == "legacy":
+            if not self.updated_recommendation.strip():
+                raise ValueError("legacy recommendation must not be empty")
+        elif self.updated_recommendation not in ("YES", "NO"):
+            raise ValueError("updated_recommendation must be YES or NO")
+
+
+def _validate_provenance(provider: str, model: str, response_type: str) -> None:
+    if not isinstance(provider, str) or not provider.strip():
+        raise ValueError("provider provenance must not be empty")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("model provenance must not be empty")
+    if response_type not in ("real_ai", "simulated", "legacy"):
+        raise ValueError("response_type must be real_ai, simulated, or legacy")
 
 
 @dataclass(frozen=True)
@@ -127,6 +187,7 @@ class CouncilResult:
 class CommanderDecision:
     option: CommanderOption
     explanation: str
+    decided_at: str = ""
 
 
 class CouncilMeeting:
@@ -138,6 +199,7 @@ class CouncilMeeting:
         seats: tuple[str, ...] = DEFAULT_SEATS,
         *,
         mission_snapshot: MissionSnapshot | None = None,
+        max_discussion_rounds: int = 3,
     ) -> None:
         normalized_motion = motion.strip()
         if not normalized_motion:
@@ -146,6 +208,12 @@ class CouncilMeeting:
             raise ValueError("seats must contain non-empty identifiers")
         if len(set(seats)) != len(seats):
             raise ValueError("seat identifiers must be unique")
+        if (
+            isinstance(max_discussion_rounds, bool)
+            or not isinstance(max_discussion_rounds, int)
+            or not 1 <= max_discussion_rounds <= 8
+        ):
+            raise ValueError("max_discussion_rounds must be between 1 and 8")
 
         self._motion = normalized_motion
         self._seats = tuple(seats)
@@ -155,8 +223,10 @@ class CouncilMeeting:
             raise ValueError("mission_snapshot must be a MissionSnapshot")
         self._mission_snapshot = mission_snapshot
         self._state = MeetingState.IDLE
+        self._max_discussion_rounds = max_discussion_rounds
+        self._discussion_round = 0
         self._analyses: dict[str, AgentAnalysis] = {}
-        self._discussions: dict[str, AgentDiscussion] = {}
+        self._discussions: dict[tuple[int, str], AgentDiscussion] = {}
         self._vote_history: list[VoteRecord] = []
         self._commander_decision: CommanderDecision | None = None
 
@@ -172,10 +242,17 @@ class CouncilMeeting:
         discussions: tuple[AgentDiscussion, ...],
         vote_history: tuple[VoteRecord, ...],
         commander_decision: CommanderDecision | None,
+        discussion_round: int | None = None,
+        max_discussion_rounds: int = 3,
     ) -> "CouncilMeeting":
         if not isinstance(state, MeetingState):
             raise ValueError("state must be a MeetingState")
-        meeting = cls(motion, seats, mission_snapshot=mission_snapshot)
+        meeting = cls(
+            motion,
+            seats,
+            mission_snapshot=mission_snapshot,
+            max_discussion_rounds=max_discussion_rounds,
+        )
         states = tuple(MeetingState)
         target_index = states.index(state)
 
@@ -189,10 +266,20 @@ class CouncilMeeting:
             raise ValueError("analyses cannot exist before the analysis phase")
         if target_index >= states.index(MeetingState.DISCUSSION):
             meeting.start_discussion()
-            for discussion in discussions:
+            for discussion in sorted(
+                discussions, key=lambda item: (item.round_number, item.agent_id)
+            ):
+                while meeting.discussion_round < discussion.round_number:
+                    meeting.start_next_discussion_round()
                 meeting.submit_discussion(discussion)
         elif discussions:
             raise ValueError("discussions cannot exist before the discussion phase")
+        if target_index >= states.index(MeetingState.DISCUSSION):
+            requested_round = discussion_round or (
+                max((item.round_number for item in discussions), default=1)
+            )
+            while meeting.discussion_round < requested_round:
+                meeting.start_next_discussion_round()
         if target_index >= states.index(MeetingState.INITIAL_VOTING):
             meeting.start_initial_voting()
             for vote in vote_history:
@@ -222,6 +309,7 @@ class CouncilMeeting:
             meeting.decide(
                 commander_decision.option,
                 commander_decision.explanation,
+                commander_decision.decided_at,
             )
         elif commander_decision is not None:
             raise ValueError("commander decision exists before the final phase")
@@ -248,8 +336,50 @@ class CouncilMeeting:
         return MappingProxyType(self._analyses)
 
     @property
-    def discussions(self) -> Mapping[str, AgentDiscussion]:
+    def discussions(self) -> Mapping[tuple[int, str], AgentDiscussion]:
         return MappingProxyType(self._discussions)
+
+    @property
+    def discussion_round(self) -> int:
+        return self._discussion_round
+
+    @property
+    def max_discussion_rounds(self) -> int:
+        return self._max_discussion_rounds
+
+    @property
+    def unresolved_disagreements(self) -> tuple[str, ...]:
+        recommendations: dict[str, str] = {}
+        for agent_id, analysis in self._analyses.items():
+            discussions = [
+                discussion
+                for (round_number, seat), discussion in self._discussions.items()
+                if seat == agent_id
+            ]
+            latest = max(discussions, key=lambda item: item.round_number, default=None)
+            recommendations[agent_id] = (
+                latest.updated_recommendation if latest else analysis.recommendation
+            )
+        values = {
+            discussion
+            for (round_number, _), response in self._discussions.items()
+            if round_number == self._discussion_round
+            for discussion in response.unresolved_disagreements
+        }
+        yes = tuple(
+            agent_id for agent_id, choice in recommendations.items() if choice == "YES"
+        )
+        no = tuple(
+            agent_id for agent_id, choice in recommendations.items() if choice == "NO"
+        )
+        if yes and no:
+            values.add(
+                "Final recommendations remain split: YES from "
+                + ", ".join(yes)
+                + "; NO from "
+                + ", ".join(no)
+            )
+        return tuple(sorted(values))
 
     @property
     def commander_decision(self) -> CommanderDecision | None:
@@ -287,7 +417,13 @@ class CouncilMeeting:
         self._analyses[analysis.agent_id] = analysis
 
     def start_discussion(self) -> None:
-        self._transition(MeetingState.ANALYSIS, MeetingState.DISCUSSION)
+        self._require_state(MeetingState.ANALYSIS)
+        if len(self._analyses) < 2:
+            raise RuntimeError(
+                "at least two actual analyses are required for peer discussion"
+            )
+        self._state = MeetingState.DISCUSSION
+        self._discussion_round = 1
 
     def submit_discussion(self, discussion: AgentDiscussion) -> None:
         self._require_state(MeetingState.DISCUSSION)
@@ -298,12 +434,47 @@ class CouncilMeeting:
             agent_id != discussion.agent_id for agent_id in self.analyses
         ):
             raise ValueError("discussion requires another agent's analysis")
-        if discussion.agent_id in self.discussions:
-            raise ValueError(f"discussion already submitted by {discussion.agent_id}")
-        self._discussions[discussion.agent_id] = discussion
+        if discussion.round_number != self.discussion_round:
+            raise ValueError("discussion response round does not match the current round")
+        key = (discussion.round_number, discussion.agent_id)
+        if key in self.discussions:
+            raise ValueError(
+                f"discussion already submitted by {discussion.agent_id} "
+                f"for round {discussion.round_number}"
+            )
+        self._discussions[key] = discussion
+
+    def start_next_discussion_round(self) -> None:
+        self._require_state(MeetingState.DISCUSSION)
+        if self.discussion_round >= self.max_discussion_rounds:
+            raise RuntimeError("maximum discussion rounds reached")
+        if not self._discussion_round_complete(self.discussion_round):
+            raise RuntimeError("current discussion round is incomplete")
+        self._discussion_round += 1
 
     def start_initial_voting(self) -> None:
-        self._transition(MeetingState.DISCUSSION, MeetingState.INITIAL_VOTING)
+        self._require_state(MeetingState.DISCUSSION)
+        if any(
+            analysis.response_type == "legacy"
+            for analysis in self._analyses.values()
+        ) or any(
+            response.response_type == "legacy"
+            for response in self._discussions.values()
+        ):
+            raise RuntimeError(
+                "legacy responses lack verified recommendation/provenance fields"
+            )
+        if not self._discussion_round_complete(self.discussion_round):
+            raise RuntimeError("current discussion round is incomplete")
+        if self.discussion_round < self.max_discussion_rounds:
+            raise RuntimeError("maximum discussion rounds have not been completed")
+        self._state = MeetingState.INITIAL_VOTING
+
+    def _discussion_round_complete(self, round_number: int) -> bool:
+        return bool(self.analyses) and all(
+            (round_number, agent_id) in self._discussions
+            for agent_id in self.analyses
+        )
 
     def submit_initial_vote(self, agent_id: str, choice: VoteChoice) -> None:
         self._require_state(MeetingState.INITIAL_VOTING)
@@ -376,7 +547,12 @@ class CouncilMeeting:
             votes=votes,
         )
 
-    def decide(self, option: CommanderOption, explanation: str = "") -> None:
+    def decide(
+        self,
+        option: CommanderOption,
+        explanation: str = "",
+        decided_at: str | None = None,
+    ) -> None:
         self._require_state(MeetingState.FINALIZED)
         validated_option = self._validate_commander_option(option)
         normalized_explanation = explanation.strip()
@@ -392,7 +568,13 @@ class CouncilMeeting:
             raise ValueError("requesting another meeting requires an explanation")
 
         self._commander_decision = CommanderDecision(
-            validated_option, normalized_explanation
+            validated_option,
+            normalized_explanation,
+            (
+                decided_at
+                if decided_at is not None
+                else datetime.now(timezone.utc).isoformat()
+            ),
         )
         self._state = MeetingState.COMMANDER_DECISION
 

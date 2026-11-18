@@ -3,7 +3,7 @@
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 from urllib.parse import urlsplit
@@ -52,6 +52,9 @@ class StoredMeeting:
     vote_history: tuple[VoteRecord, ...]
     commander_decision: CommanderDecision | None
     result: CouncilResult | None
+    discussion_round: int = 0
+    max_discussion_rounds: int = 3
+    created_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -276,7 +279,8 @@ class SQLiteStore:
 
             existing = self._connection.execute(
                 """
-                SELECT mission_id, motion, seats_json, mission_snapshot_json, state
+                SELECT mission_id, motion, seats_json, mission_snapshot_json, state,
+                       discussion_round, max_discussion_rounds, created_at
                 FROM meetings WHERE meeting_id = ?
                 """,
                 (meeting_id,),
@@ -286,8 +290,9 @@ class SQLiteStore:
                     """
                     INSERT INTO meetings
                         (meeting_id, mission_id, motion, seats_json,
-                         mission_snapshot_json, state)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                         mission_snapshot_json, state, discussion_round,
+                         max_discussion_rounds, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         meeting_id,
@@ -296,6 +301,9 @@ class SQLiteStore:
                         seats_json,
                         snapshot_json,
                         meeting.state.value,
+                        meeting.discussion_round,
+                        meeting.max_discussion_rounds,
+                        datetime.now(timezone.utc).isoformat(),
                     ),
                 )
             else:
@@ -304,12 +312,14 @@ class SQLiteStore:
                     existing["motion"],
                     existing["seats_json"],
                     existing["mission_snapshot_json"],
+                    existing["max_discussion_rounds"],
                 )
                 expected_identity = (
                     mission_id,
                     meeting.motion,
                     seats_json,
                     snapshot_json,
+                    meeting.max_discussion_rounds,
                 )
                 if identity != expected_identity:
                     raise PersistenceConflictError(
@@ -318,9 +328,17 @@ class SQLiteStore:
                 stored_state = MeetingState(existing["state"])
                 if self._STATE_ORDER[meeting.state] < self._STATE_ORDER[stored_state]:
                     raise PersistenceConflictError("meeting state cannot move backward")
+                if meeting.discussion_round < existing["discussion_round"]:
+                    raise PersistenceConflictError(
+                        "discussion round cannot move backward"
+                    )
                 self._connection.execute(
-                    "UPDATE meetings SET state = ? WHERE meeting_id = ?",
-                    (meeting.state.value, meeting_id),
+                    """
+                    UPDATE meetings
+                    SET state = ?, discussion_round = ?
+                    WHERE meeting_id = ?
+                    """,
+                    (meeting.state.value, meeting.discussion_round, meeting_id),
                 )
 
             for analysis in meeting.analyses.values():
@@ -337,6 +355,13 @@ class SQLiteStore:
                         "missing_information",
                         "suggested_improvements",
                         "confidence",
+                        "supporting_evidence_json",
+                        "main_concerns_json",
+                        "alternative_recommendations_json",
+                        "provider",
+                        "model",
+                        "response_type",
+                        "completed_at",
                     ),
                     (
                         analysis.recommendation,
@@ -347,13 +372,20 @@ class SQLiteStore:
                         analysis.missing_information,
                         analysis.suggested_improvements,
                         analysis.confidence,
+                        json.dumps(analysis.supporting_evidence),
+                        json.dumps(analysis.main_concerns),
+                        json.dumps(analysis.alternative_recommendations),
+                        analysis.provider,
+                        analysis.model,
+                        analysis.response_type,
+                        analysis.completed_at,
                     ),
                 )
             for discussion in meeting.discussions.values():
                 self._save_immutable_row(
-                    "agent_discussions",
-                    ("meeting_id", "agent_id"),
-                    (meeting_id, discussion.agent_id),
+                    "discussion_rounds",
+                    ("meeting_id", "round_number", "agent_id"),
+                    (meeting_id, discussion.round_number, discussion.agent_id),
                     (
                         "challenges",
                         "reconsideration",
@@ -361,6 +393,16 @@ class SQLiteStore:
                         "updated_recommendation",
                         "reasoning",
                         "confidence",
+                        "agreement",
+                        "disagreement",
+                        "weak_reasoning",
+                        "missing_information",
+                        "possible_risks",
+                        "unresolved_disagreements_json",
+                        "provider",
+                        "model",
+                        "response_type",
+                        "completed_at",
                     ),
                     (
                         discussion.challenges,
@@ -369,6 +411,16 @@ class SQLiteStore:
                         discussion.updated_recommendation,
                         discussion.reasoning,
                         discussion.confidence,
+                        discussion.agreement,
+                        discussion.disagreement,
+                        discussion.weak_reasoning,
+                        discussion.missing_information,
+                        discussion.possible_risks,
+                        json.dumps(discussion.unresolved_disagreements),
+                        discussion.provider,
+                        discussion.model,
+                        discussion.response_type,
+                        discussion.completed_at,
                     ),
                 )
             self._save_votes(meeting_id, meeting.vote_history)
@@ -379,15 +431,20 @@ class SQLiteStore:
                     "commander_decisions",
                     ("meeting_id",),
                     (meeting_id,),
-                    ("option", "explanation"),
-                    (decision.option.value, decision.explanation),
+                    ("option", "explanation", "decided_at"),
+                    (
+                        decision.option.value,
+                        decision.explanation,
+                        decision.decided_at,
+                    ),
                 )
 
     def load_meeting(self, meeting_id: str) -> StoredMeeting | None:
         row = self._connection.execute(
             """
             SELECT meeting_id, mission_id, motion, state, seats_json,
-                   mission_snapshot_json
+                   mission_snapshot_json, discussion_round, max_discussion_rounds,
+                   created_at
             FROM meetings WHERE meeting_id = ?
             """,
             (meeting_id,),
@@ -411,19 +468,72 @@ class SQLiteStore:
                     missing_information=item["missing_information"],
                     suggested_improvements=item["suggested_improvements"],
                     confidence=item["confidence"],
+                    supporting_evidence=tuple(
+                        json.loads(item["supporting_evidence_json"])
+                    ),
+                    main_concerns=tuple(json.loads(item["main_concerns_json"])),
+                    alternative_recommendations=tuple(
+                        json.loads(item["alternative_recommendations_json"])
+                    ),
+                    provider=(
+                        "legacy record"
+                        if item["provider"] == "unknown"
+                        else item["provider"]
+                    ),
+                    model=item["model"],
+                    response_type=(
+                        "legacy"
+                        if item["provider"] == "unknown"
+                        and not item["completed_at"]
+                        else item["response_type"]
+                    ),
+                    completed_at=item["completed_at"],
                 )
                 for item in self._connection.execute(
                     """
                     SELECT agent_id, recommendation, reasoning, facts_json,
                            assumptions_json, main_risks, missing_information,
-                           suggested_improvements, confidence
+                           suggested_improvements, confidence,
+                           supporting_evidence_json, main_concerns_json,
+                           alternative_recommendations_json, provider, model,
+                           response_type, completed_at
                     FROM agent_analyses WHERE meeting_id = ?
                     """,
                     (meeting_id,),
                 )
             }
-            discussions_by_id = {
-                item["agent_id"]: AgentDiscussion(
+            discussion_rows = self._connection.execute(
+                """
+                SELECT round_number, agent_id, challenges, reconsideration,
+                       recommendation_changed, updated_recommendation,
+                       reasoning, confidence, agreement, disagreement,
+                       weak_reasoning, missing_information, possible_risks,
+                       unresolved_disagreements_json, provider, model,
+                       response_type, completed_at
+                FROM discussion_rounds WHERE meeting_id = ?
+                ORDER BY round_number, agent_id
+                """,
+                (meeting_id,),
+            ).fetchall()
+            if not discussion_rows:
+                discussion_rows = self._connection.execute(
+                    """
+                    SELECT 1 AS round_number, agent_id, challenges, reconsideration,
+                           recommendation_changed, updated_recommendation,
+                           reasoning, confidence, 'Not stated' AS agreement,
+                           'Not stated' AS disagreement,
+                           'Not stated' AS weak_reasoning,
+                           'Not stated' AS missing_information,
+                           'Not stated' AS possible_risks,
+                           '[]' AS unresolved_disagreements_json,
+                           'unknown' AS provider, 'unknown' AS model,
+                           'legacy' AS response_type, '' AS completed_at
+                    FROM agent_discussions WHERE meeting_id = ?
+                    """,
+                    (meeting_id,),
+                ).fetchall()
+            discussions_by_round = {
+                (item["round_number"], item["agent_id"]): AgentDiscussion(
                     agent_id=item["agent_id"],
                     challenges=item["challenges"],
                     reconsideration=item["reconsideration"],
@@ -431,16 +541,21 @@ class SQLiteStore:
                     updated_recommendation=item["updated_recommendation"],
                     reasoning=item["reasoning"],
                     confidence=item["confidence"],
+                    round_number=item["round_number"],
+                    agreement=item["agreement"],
+                    disagreement=item["disagreement"],
+                    weak_reasoning=item["weak_reasoning"],
+                    missing_information=item["missing_information"],
+                    possible_risks=item["possible_risks"],
+                    unresolved_disagreements=tuple(
+                        json.loads(item["unresolved_disagreements_json"])
+                    ),
+                    provider=item["provider"],
+                    model=item["model"],
+                    response_type=item["response_type"],
+                    completed_at=item["completed_at"],
                 )
-                for item in self._connection.execute(
-                    """
-                    SELECT agent_id, challenges, reconsideration,
-                           recommendation_changed, updated_recommendation,
-                           reasoning, confidence
-                    FROM agent_discussions WHERE meeting_id = ?
-                    """,
-                    (meeting_id,),
-                )
+                for item in discussion_rows
             }
             vote_history = tuple(
                 VoteRecord(
@@ -458,7 +573,7 @@ class SQLiteStore:
                 )
             )
             decision_row = self._connection.execute(
-                "SELECT option, explanation FROM commander_decisions WHERE meeting_id = ?",
+                "SELECT option, explanation, decided_at FROM commander_decisions WHERE meeting_id = ?",
                 (meeting_id,),
             ).fetchone()
             decision = (
@@ -467,6 +582,7 @@ class SQLiteStore:
                 else CommanderDecision(
                     option=CommanderOption(decision_row["option"]),
                     explanation=decision_row["explanation"],
+                    decided_at=decision_row["decided_at"],
                 )
             )
             state = MeetingState(row["state"])
@@ -486,13 +602,26 @@ class SQLiteStore:
                     if seat in analyses_by_id
                 ),
                 discussions=tuple(
-                    discussions_by_id[seat]
-                    for seat in seats
-                    if seat in discussions_by_id
+                    discussions_by_round[key]
+                    for key in sorted(
+                        discussions_by_round,
+                        key=lambda item: (item[0], seats.index(item[1])),
+                    )
                 ),
                 vote_history=vote_history,
                 commander_decision=decision,
                 result=result,
+                discussion_round=(
+                    row["discussion_round"]
+                    or (
+                        1
+                        if self._STATE_ORDER[state]
+                        >= self._STATE_ORDER[MeetingState.DISCUSSION]
+                        else 0
+                    )
+                ),
+                max_discussion_rounds=row["max_discussion_rounds"],
+                created_at=row["created_at"],
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise StoredDataError("Stored council meeting data is invalid") from exc
@@ -514,6 +643,208 @@ class SQLiteStore:
                 raise StoredDataError("Stored meeting disappeared while listing")
             meetings.append(meeting)
         return tuple(meetings)
+
+    def search_mission_history(
+        self, query: str, mission_id: str | None = None, limit: int = 50
+    ) -> tuple[dict[str, object], ...]:
+        normalized_query = self._required_text(query, "query").casefold()
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        entries: list[dict[str, object]] = []
+
+        def add(
+            mission: str,
+            content: str,
+            source: str,
+            occurred_at: str,
+        ) -> None:
+            if normalized_query in content.casefold():
+                entries.append(
+                    {
+                        "mission_id": mission,
+                        "content": content,
+                        "source": source,
+                        "occurred_at": occurred_at
+                        or "Date unavailable (legacy record)",
+                        "historical": True,
+                        "warning": (
+                            "Historical information only; verify before treating "
+                            "it as current."
+                        ),
+                    }
+                )
+
+        mission_filter = "" if mission_id is None else "WHERE mission_id = ?"
+        mission_args = () if mission_id is None else (mission_id,)
+        missions = self._connection.execute(
+            f"SELECT mission_id FROM missions {mission_filter}",
+            mission_args,
+        ).fetchall()
+        event_categories = {
+            "known_threat": "mission.threat_recorded",
+            "unknown_information": "mission.unknown_information_recorded",
+            "observation": "mission.observation_recorded",
+            "council_decision": "mission.council_decision",
+            "commander_order": "mission.commander_order",
+        }
+        source_labels = {
+            "known_threat": "confirmed threat record",
+            "unknown_information": "unknown information record",
+            "observation": "historical observation",
+            "council_decision": "council decision",
+            "commander_order": "commander order",
+        }
+        for mission_row in missions:
+            current_mission_id = mission_row["mission_id"]
+            events_by_category: dict[str, list[str]] = {}
+            for event in self._connection.execute(
+                """
+                SELECT category, occurred_at FROM mission_events
+                WHERE mission_id = ? ORDER BY sequence
+                """,
+                (current_mission_id,),
+            ):
+                events_by_category.setdefault(event["category"], []).append(
+                    event["occurred_at"]
+                )
+            for item in self._connection.execute(
+                """
+                SELECT category, position, value FROM mission_items
+                WHERE mission_id = ? AND category != 'equipment'
+                ORDER BY category, position
+                """,
+                (current_mission_id,),
+            ):
+                category = item["category"]
+                event_category = event_categories.get(category, "")
+                dates = events_by_category.get(event_category, [])
+                occurred_at = (
+                    dates[item["position"]]
+                    if item["position"] < len(dates)
+                    else ""
+                )
+                add(
+                    current_mission_id,
+                    item["value"],
+                    source_labels.get(category, category),
+                    occurred_at,
+                )
+
+        if mission_id is None:
+            meeting_rows = self._connection.execute(
+                """
+                SELECT meeting_id, mission_id, motion, created_at
+                FROM meetings ORDER BY rowid
+                """
+            ).fetchall()
+        else:
+            meeting_rows = self._connection.execute(
+                """
+                SELECT meeting_id, mission_id, motion, created_at
+                FROM meetings WHERE mission_id = ? ORDER BY rowid
+                """,
+                (mission_id,),
+            ).fetchall()
+        for meeting in meeting_rows:
+            meeting_id = meeting["meeting_id"]
+            current_mission_id = meeting["mission_id"]
+            add(
+                current_mission_id,
+                meeting["motion"],
+                f"council motion · {meeting_id}",
+                meeting["created_at"],
+            )
+            for analysis in self._connection.execute(
+                """
+                SELECT agent_id, recommendation, main_risks,
+                       missing_information, main_concerns_json, completed_at
+                FROM agent_analyses WHERE meeting_id = ?
+                """,
+                (meeting_id,),
+            ):
+                for label, content in (
+                    ("recommendation", analysis["recommendation"]),
+                    ("identified risk", analysis["main_risks"]),
+                    ("missing information", analysis["missing_information"]),
+                    (
+                        "main concerns",
+                        "; ".join(json.loads(analysis["main_concerns_json"])),
+                    ),
+                ):
+                    add(
+                        current_mission_id,
+                        content,
+                        f"council analysis · {analysis['agent_id']} · {label}",
+                        analysis["completed_at"],
+                    )
+
+            discussion_rows = self._connection.execute(
+                """
+                SELECT round_number, agent_id, disagreement, weak_reasoning,
+                       possible_risks, unresolved_disagreements_json, completed_at
+                FROM discussion_rounds WHERE meeting_id = ?
+                ORDER BY round_number, agent_id
+                """,
+                (meeting_id,),
+            ).fetchall()
+            if not discussion_rows:
+                discussion_rows = self._connection.execute(
+                    """
+                    SELECT 1 AS round_number, agent_id, challenges AS disagreement,
+                           reasoning AS weak_reasoning,
+                           'Not recorded' AS possible_risks,
+                           '[]' AS unresolved_disagreements_json,
+                           '' AS completed_at
+                    FROM agent_discussions WHERE meeting_id = ?
+                    """,
+                    (meeting_id,),
+                ).fetchall()
+            for discussion in discussion_rows:
+                for label, content in (
+                    ("disagreement", discussion["disagreement"]),
+                    ("weak reasoning", discussion["weak_reasoning"]),
+                    ("possible risk", discussion["possible_risks"]),
+                    (
+                        "unresolved disagreement",
+                        "; ".join(
+                            json.loads(
+                                discussion["unresolved_disagreements_json"]
+                            )
+                        ),
+                    ),
+                ):
+                    add(
+                        current_mission_id,
+                        content,
+                        (
+                            f"council discussion · round "
+                            f"{discussion['round_number']} · "
+                            f"{discussion['agent_id']} · {label}"
+                        ),
+                        discussion["completed_at"],
+                    )
+
+            decision = self._connection.execute(
+                """
+                SELECT option, explanation, decided_at
+                FROM commander_decisions WHERE meeting_id = ?
+                """,
+                (meeting_id,),
+            ).fetchone()
+            if decision is not None:
+                add(
+                    current_mission_id,
+                    f"{decision['option']}: {decision['explanation']}",
+                    f"commander decision · {meeting_id}",
+                    decision["decided_at"],
+                )
+
+        entries.sort(key=lambda item: item["occurred_at"], reverse=True)
+        entries.sort(
+            key=lambda item: item["occurred_at"]
+            == "Date unavailable (legacy record)"
+        )
+        return tuple(entries[:limit])
 
     def save_provider_config(
         self,
@@ -779,7 +1110,7 @@ class SQLiteStore:
 
     def _initialize_schema(self) -> None:
         version = self._connection.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1):
+        if version not in (0, 1, 2):
             raise PersistenceError(f"unsupported database schema version: {version}")
         with self._connection:
             self._connection.executescript(
@@ -829,7 +1160,11 @@ class SQLiteStore:
                         'IDLE', 'MEETING_STARTED', 'ANALYSIS', 'DISCUSSION',
                         'INITIAL_VOTING', 'REVISION', 'FINALIZED',
                         'COMMANDER_DECISION'
-                    ))
+                    )),
+                    discussion_round INTEGER NOT NULL DEFAULT 0,
+                    max_discussion_rounds INTEGER NOT NULL DEFAULT 3
+                        CHECK (max_discussion_rounds BETWEEN 1 AND 8),
+                    created_at TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS agent_analyses (
                     meeting_id TEXT NOT NULL REFERENCES meetings(meeting_id) ON DELETE CASCADE,
@@ -842,6 +1177,13 @@ class SQLiteStore:
                     missing_information TEXT NOT NULL,
                     suggested_improvements TEXT NOT NULL,
                     confidence REAL NOT NULL CHECK (confidence BETWEEN 0 AND 1),
+                    supporting_evidence_json TEXT NOT NULL DEFAULT '[]',
+                    main_concerns_json TEXT NOT NULL DEFAULT '[]',
+                    alternative_recommendations_json TEXT NOT NULL DEFAULT '[]',
+                    provider TEXT NOT NULL DEFAULT 'unknown',
+                    model TEXT NOT NULL DEFAULT 'unknown',
+                    response_type TEXT NOT NULL DEFAULT 'real_ai',
+                    completed_at TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (meeting_id, agent_id)
                 );
                 CREATE TABLE IF NOT EXISTS agent_discussions (
@@ -855,6 +1197,33 @@ class SQLiteStore:
                     reasoning TEXT NOT NULL,
                     confidence REAL NOT NULL CHECK (confidence BETWEEN 0 AND 1),
                     PRIMARY KEY (meeting_id, agent_id)
+                );
+                CREATE TABLE IF NOT EXISTS discussion_rounds (
+                    meeting_id TEXT NOT NULL REFERENCES meetings(meeting_id) ON DELETE CASCADE,
+                    round_number INTEGER NOT NULL CHECK (round_number >= 1),
+                    agent_id TEXT NOT NULL,
+                    challenges TEXT NOT NULL,
+                    reconsideration TEXT NOT NULL,
+                    recommendation_changed INTEGER NOT NULL
+                        CHECK (recommendation_changed IN (0, 1)),
+                    updated_recommendation TEXT NOT NULL CHECK (
+                        updated_recommendation IN ('YES', 'NO')
+                    ),
+                    reasoning TEXT NOT NULL,
+                    confidence REAL NOT NULL CHECK (confidence BETWEEN 0 AND 1),
+                    agreement TEXT NOT NULL,
+                    disagreement TEXT NOT NULL,
+                    weak_reasoning TEXT NOT NULL,
+                    missing_information TEXT NOT NULL,
+                    possible_risks TEXT NOT NULL,
+                    unresolved_disagreements_json TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    response_type TEXT NOT NULL CHECK (
+                        response_type IN ('real_ai', 'simulated')
+                    ),
+                    completed_at TEXT NOT NULL,
+                    PRIMARY KEY (meeting_id, round_number, agent_id)
                 );
                 CREATE TABLE IF NOT EXISTS votes (
                     meeting_id TEXT NOT NULL REFERENCES meetings(meeting_id) ON DELETE CASCADE,
@@ -871,7 +1240,8 @@ class SQLiteStore:
                     option TEXT NOT NULL CHECK (option IN (
                         'AUTHORIZE', 'REJECT', 'REQUEST_ANOTHER_MEETING'
                     )),
-                    explanation TEXT NOT NULL
+                    explanation TEXT NOT NULL,
+                    decided_at TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS provider_configs (
                     config_id TEXT PRIMARY KEY,
@@ -882,7 +1252,121 @@ class SQLiteStore:
                 );
                 """
             )
-            self._connection.execute("PRAGMA user_version = 1")
+            self._ensure_column(
+                "meetings", "discussion_round", "INTEGER NOT NULL DEFAULT 0"
+            )
+            self._ensure_column(
+                "meetings",
+                "max_discussion_rounds",
+                "INTEGER NOT NULL DEFAULT 3",
+            )
+            self._ensure_column("meetings", "created_at", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(
+                "commander_decisions", "decided_at", "TEXT NOT NULL DEFAULT ''"
+            )
+            for name, declaration in (
+                ("supporting_evidence_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("main_concerns_json", "TEXT NOT NULL DEFAULT '[]'"),
+                (
+                    "alternative_recommendations_json",
+                    "TEXT NOT NULL DEFAULT '[]'",
+                ),
+                ("provider", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("model", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("response_type", "TEXT NOT NULL DEFAULT 'real_ai'"),
+                ("completed_at", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                self._ensure_column("agent_analyses", name, declaration)
+            if version == 1:
+                self._connection.execute(
+                    """
+                    UPDATE meetings SET max_discussion_rounds = 1
+                    WHERE state IN (
+                        'DISCUSSION', 'INITIAL_VOTING', 'REVISION',
+                        'FINALIZED', 'COMMANDER_DECISION'
+                    )
+                    """
+                )
+            self._install_immutable_history_triggers()
+            self._connection.execute("PRAGMA user_version = 2")
+
+    def _install_immutable_history_triggers(self) -> None:
+        for table in (
+            "mission_events",
+            "agent_analyses",
+            "agent_discussions",
+            "discussion_rounds",
+            "votes",
+            "commander_decisions",
+        ):
+            for operation in ("UPDATE", "DELETE"):
+                name = f"immutable_{table}_{operation.lower()}"
+                self._connection.execute(
+                    f"""
+                    CREATE TRIGGER IF NOT EXISTS {name}
+                    BEFORE {operation} ON {table}
+                    BEGIN
+                        SELECT RAISE(ABORT, '{table} history is append-only');
+                    END
+                    """
+                )
+        self._connection.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS immutable_meeting_identity
+            BEFORE UPDATE ON meetings
+            WHEN NEW.meeting_id != OLD.meeting_id
+              OR NEW.mission_id != OLD.mission_id
+              OR NEW.motion != OLD.motion
+              OR NEW.seats_json != OLD.seats_json
+              OR NEW.mission_snapshot_json != OLD.mission_snapshot_json
+              OR NEW.max_discussion_rounds != OLD.max_discussion_rounds
+              OR NEW.created_at != OLD.created_at
+              OR NEW.discussion_round < OLD.discussion_round
+              OR NOT (
+                    NEW.state = OLD.state
+                    OR (OLD.state = 'MEETING_STARTED' AND NEW.state = 'ANALYSIS')
+                    OR (OLD.state = 'ANALYSIS' AND NEW.state = 'DISCUSSION')
+                    OR (OLD.state = 'DISCUSSION' AND NEW.state = 'INITIAL_VOTING')
+                    OR (OLD.state = 'INITIAL_VOTING' AND NEW.state = 'REVISION')
+                    OR (OLD.state = 'REVISION' AND NEW.state = 'FINALIZED')
+                    OR (OLD.state = 'FINALIZED' AND NEW.state = 'COMMANDER_DECISION')
+              )
+            BEGIN
+                SELECT RAISE(ABORT, 'meeting audit history is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS immutable_meeting_delete
+            BEFORE DELETE ON meetings
+            BEGIN
+                SELECT RAISE(ABORT, 'meeting audit history is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS immutable_mission_item_update
+            BEFORE UPDATE ON mission_items
+            WHEN OLD.category != 'equipment'
+            BEGIN
+                SELECT RAISE(ABORT, 'mission item history is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS immutable_mission_item_delete
+            BEFORE DELETE ON mission_items
+            WHEN OLD.category != 'equipment'
+            BEGIN
+                SELECT RAISE(ABORT, 'mission item history is append-only');
+            END;
+            """
+        )
+
+    def _ensure_column(
+        self, table: str, column: str, declaration: str
+    ) -> None:
+        existing = {
+            row["name"]
+            for row in self._connection.execute(
+                f"PRAGMA table_info({table})"
+            ).fetchall()
+        }
+        if column not in existing:
+            self._connection.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+            )
 
     @staticmethod
     def _mission_to_json(mission: MissionSnapshot) -> str:

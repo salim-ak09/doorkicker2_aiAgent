@@ -7,12 +7,16 @@ Operation AI Squad is a local-first mission-planning and AI council application.
 ## Features
 
 - Create and update missions, operator rosters, equipment, confirmed threats, unknowns, and observations.
-- Preserve immutable mission snapshots for each council meeting and append-only mission/vote history in SQLite.
-- Ask three distinct council roles for independent structured analysis and peer-aware discussion through the configured AI provider.
+- Preserve immutable mission snapshots and append-only council history in SQLite, including every analysis, discussion round, vote/revision, result, and Commander decision.
+- Ask three distinct council roles for separate structured analyses. The default roles all use the same configured Ollama provider and model; role prompts are not three independent AI models.
+- Run bounded, multi-round peer discussion (three rounds by default), preserving each actual response and stopping if a participating agent has not responded.
+- Require each analysis to include a YES/NO recommendation, confidence, supporting evidence, concerns, missing information, assumptions, and alternatives. Highlight low confidence and unresolved disagreements for Commander review.
+- Search prior observations, threats, decisions, orders, risks, and council disagreements. Results include source/date and are explicitly historical; they are not promoted to current mission facts.
 - Record initial votes and explained vote revisions manually. The AI does not cast votes or issue orders.
 - Calculate a majority result, show missing voters without fabricating votes, and record a commander decision.
-- Resume in-progress meetings after restarting the service.
-- View provider availability and receive live mission/council updates over WebSocket.
+- Resume in-progress meetings after restarting the service, including an interrupted discussion round.
+- View provider/model availability, request failures, and CPU-inference processing status; inference requests are serialized.
+- Protect local access with a configured token, authenticated HTTP-only session cookie, CSRF/origin checks, and authenticated WebSocket connections. Requests from non-loopback clients are rejected.
 - Browse the interactive API reference at `/docs`.
 
 ## Requirements
@@ -43,6 +47,16 @@ Install and start Ollama separately, then download the default model:
 ollama pull qwen2.5:3b
 ```
 
+Configure a private local access token and optional inference/debate limits:
+
+```powershell
+$env:AI_SQUAD_ACCESS_TOKEN = (& py -3 -c "import secrets; print(secrets.token_urlsafe(32))").Trim()
+$env:OLLAMA_TIMEOUT_SECONDS = "120"
+$env:AI_SQUAD_MAX_DISCUSSION_ROUNDS = "3"
+```
+
+Keep the access token private. The service refuses to start without one.
+
 If Ollama listens somewhere other than `http://127.0.0.1:11434`, configure its HTTP endpoint for the current PowerShell session:
 
 ```powershell
@@ -69,10 +83,11 @@ The application stores no provider API keys. Mission and council data is saved l
 
 1. Create a mission and enter the information available to you. Keep observations, confirmed facts, assumptions, and unknowns distinct.
 2. Create a council meeting with one exact motion. Each agent receives the same saved mission snapshot.
-3. Start analysis and run each available agent. Provider failures or malformed responses are shown as errors; they are not replaced with guessed analyses.
-4. Start discussion after at least two analyses have been recorded. Ask participating agents to consider their peers' actual analyses.
-5. Start voting and record each member's vote manually. Votes can be revised with an explanation. The result identifies any missing voters.
-6. Review the majority result and record a commander decision. Authorizing an unapproved motion is rejected by the backend.
+3. Optionally search mission history. Matching, source-labeled records are passed separately to the agents as historical context, never as current facts.
+4. Start analysis and run each available agent. Each response records its actual provider/model. Provider failures or malformed responses are shown as errors; they are not replaced with guessed analyses.
+5. Start discussion after at least two analyses have been recorded. Each participating agent receives the other agents' actual analyses; round 3 onward also receives prior-round responses. Complete each configured round before moving to voting.
+6. Record each member's vote manually. Votes can be revised with an explanation. The result identifies any missing voters.
+7. Review confidence and unresolved disagreements, then record a Commander decision. Authorizing an unapproved motion is rejected by the backend.
 
 Meetings and mission updates are persisted as they are made and can be continued after a service restart. Creating another meeting is a separate operator action; requesting one does not automatically start it.
 
@@ -83,12 +98,15 @@ Meetings and mission updates are persisted as they are made and can be continued
 | `GET /api/status` | Service health |
 | `GET /api/agents` | Council seats and roles |
 | `GET /api/providers` | Provider status by agent |
+| `POST /api/auth/login` | Exchange the configured access token for a local session |
 | `GET /api/missions` | List saved missions |
 | `POST /api/missions` | Create a mission |
 | `GET/PATCH /api/missions/{mission_id}` | Read or update mission state |
 | `GET /api/missions/{mission_id}/events` | Read append-only mission events |
+| `GET /api/missions/{mission_id}/history/search?query=...` | Search source- and date-labeled historical records |
 | `GET/POST /api/missions/{mission_id}/meetings` | List or create council meetings |
-| `/api/meetings/{meeting_id}/...` | Progress a meeting through analysis, discussion, voting, and commander decision |
+| `/api/meetings/{meeting_id}/...` | Progress a meeting through analysis, bounded discussion rounds, voting, and Commander decision |
+| `GET /api/processing` | Read current serialized-model processing status |
 | `WS /ws/events` | Live update notifications |
 
 The generated OpenAPI specification is available at `/openapi.json`.
@@ -97,8 +115,12 @@ The generated OpenAPI specification is available at `/openapi.json`.
 
 - If the provider panel reports Ollama unavailable, start the Ollama service and check `OLLAMA_BASE_URL`.
 - If it reports the model missing, run `ollama pull qwen2.5:3b`.
-- AI generation may take time on a CPU-only machine. Provider timeouts and invalid responses are returned as explicit API errors.
-- Bind to `127.0.0.1` for local use. The API has no authentication; **do not expose it to a public or untrusted network**.
+- AI generation may take time on a CPU-only machine. Set `OLLAMA_TIMEOUT_SECONDS` to adjust the request timeout; invalid values prevent startup.
+- Set `AI_SQUAD_MAX_DISCUSSION_ROUNDS` to an integer from 1 to 8. The default is 3.
+- The default model is `qwen2.5:3b`; all three roles use that same model/provider unless the application is configured with a different provider factory. The dashboard identifies shared provider/model assignments and does not claim model independence.
+- The service defaults to loopback binding and also rejects non-loopback clients. Do not place it behind a public or untrusted network proxy.
+- Browser/API data access requires the configured token. State-changing requests require same-origin and CSRF validation; WebSockets require an authenticated local session and matching origin.
+- Legacy database records without provider provenance are labeled as legacy. Existing in-progress legacy meetings may be readable but cannot be advanced into voting when their recommendations/provenance do not satisfy current validation.
 - WebSocket live updates require the declared `websockets` runtime dependency, installed by `requirements.txt`.
 
 ## Tests
@@ -109,7 +131,7 @@ Run the backend unit and API integration suite:
 python -m unittest discover -v
 ```
 
-The tests use controlled provider responses and do not require Ollama or the game. A real Ollama smoke test was separately completed during development; local provider availability can change.
+The tests use controlled provider responses and do not require Ollama or the game. Local provider availability can change.
 
 ## Project layout
 

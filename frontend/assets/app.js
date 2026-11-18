@@ -2,15 +2,21 @@ const app = document.querySelector("#app");
 
 const state = {
   agents: [],
+  authenticated: false,
   busy: false,
+  csrfToken: "",
   error: "",
+  historyQuery: "",
+  historyResults: [],
   meeting: null,
   meetings: [],
   mission: null,
   missions: [],
   providers: [],
+  processing: { active: false, agent_id: null, task: null },
   selectedMeetingId: null,
   selectedMissionId: null,
+  socket: null,
   socketConnected: false,
 };
 
@@ -34,11 +40,21 @@ function listMarkup(values, emptyText = "None recorded") {
   return `<ul>${values.map((value) => `<li>${escapeHtml(value)}</li>`).join("")}</ul>`;
 }
 
+function responseTypeLabel(responseType) {
+  if (responseType === "simulated") return "Simulated response";
+  if (responseType === "legacy") return "Legacy response · provider/model not recorded";
+  return "Real AI response";
+}
+
 async function api(path, options = {}) {
+  const method = options.method ?? "GET";
   const response = await fetch(path, {
     ...options,
     headers: {
       ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(method !== "GET" && path !== "/api/auth/login"
+        ? { "X-CSRF-Token": state.csrfToken }
+        : {}),
       ...options.headers,
     },
   });
@@ -54,14 +70,16 @@ async function api(path, options = {}) {
 }
 
 async function loadWorkspace() {
-  const [missionsResult, providersResult, agentsResult] = await Promise.all([
+  const [missionsResult, providersResult, agentsResult, processingResult] = await Promise.all([
     api("/api/missions"),
     api("/api/providers"),
     api("/api/agents"),
+    api("/api/processing"),
   ]);
   state.missions = missionsResult.missions;
   state.providers = providersResult.providers;
   state.agents = agentsResult.agents;
+  state.processing = processingResult;
 
   if (!state.missions.some((mission) => mission.mission_id === state.selectedMissionId)) {
     state.selectedMissionId = state.missions[0]?.mission_id ?? null;
@@ -236,17 +254,26 @@ function renderProviderPanel() {
       <div class="agent-card">
         <header>
           <strong>${escapeHtml(agent?.name ?? provider.agent_id)} · ${escapeHtml(provider.model)}</strong>
-          <span class="badge ${available ? "good" : "bad"}">${available ? "ready" : "offline"}</span>
+          <span class="badge ${available ? "good" : "bad"}">${escapeHtml(provider.availability.replaceAll("_", " "))}</span>
         </header>
-        <p class="hint">${escapeHtml(provider.detail)}</p>
+        <p class="hint">${escapeHtml(provider.provider)} · ${escapeHtml(provider.detail)}</p>
+        <p class="hint">Request: ${escapeHtml(provider.request_status.replaceAll("_", " "))}${provider.request_detail ? ` · ${escapeHtml(provider.request_detail)}` : ""}</p>
+        ${provider.shared_with > 1 ? `<p class="hint">Shared provider/model across ${provider.shared_with} council roles; role prompts do not represent independent models.</p>` : ""}
       </div>`;
   }).join("");
   return `
     <section class="panel">
       <div class="section-heading"><h2>AI provider status</h2></div>
+      <p id="processing-status" class="notice">${escapeHtml(processingLabel())}</p>
       <div class="agent-list">${rows || `<div class="empty-state">Provider status has not loaded.</div>`}</div>
       <p class="hint spacer-top">Provider availability is checked through the configured local Ollama endpoint. Models may produce errors; missing analyses are never filled in automatically.</p>
     </section>`;
+}
+
+function processingLabel() {
+  return state.processing.active
+    ? `Processing ${state.processing.task} for ${seatName(state.processing.agent_id)} · other model requests are serialized.`
+    : "Model processing idle · requests are serialized for CPU inference.";
 }
 
 function renderMeetingHistory() {
@@ -272,7 +299,10 @@ function actionButton(label, action, disabled = false, primary = false) {
   return `<button class="${primary ? "primary" : ""}" type="button" data-action="${action}" ${disabled || state.busy ? "disabled" : ""}>${label}</button>`;
 }
 
-function renderAnalysisCard(agent, analysis, discussion, phase) {
+function renderAnalysisCard(agent, analysis, discussions, phase, currentRound) {
+  const discussion = discussions.find(
+    (item) => item.round_number === currentRound,
+  );
   let action = "";
   if (phase === "ANALYSIS" && !analysis) {
     action = actionButton("Run analysis", "run-analysis", false, true)
@@ -286,23 +316,53 @@ function renderAnalysisCard(agent, analysis, discussion, phase) {
     <article class="agent-card">
       <header><div><strong>${escapeHtml(agent.name)}</strong><div class="hint">${escapeHtml(agent.role)}</div></div>${action}</header>
       ${analysis ? `
-        <p><strong>Initial recommendation:</strong> ${escapeHtml(analysis.recommendation)}</p>
+        <p><strong>Recommendation:</strong> ${escapeHtml(analysis.recommendation)} · confidence ${Math.round(analysis.confidence * 100)}%</p>
+        <p class="hint">${escapeHtml(responseTypeLabel(analysis.response_type))} · ${escapeHtml(analysis.provider)} / ${escapeHtml(analysis.model)} · ${escapeHtml(analysis.completed_at)}</p>
         <details><summary>Analysis details</summary>
           <p>${escapeHtml(analysis.reasoning)}</p>
           <p><strong>Risks:</strong> ${escapeHtml(analysis.main_risks)}</p>
           <p><strong>Unknowns:</strong> ${escapeHtml(analysis.missing_information)}</p>
-          <p><strong>Confidence:</strong> ${Math.round(analysis.confidence * 100)}%</p>
+          <p><strong>Supporting evidence:</strong> ${escapeHtml((analysis.supporting_evidence ?? []).join("; ") || "None supplied")}</p>
+          <p><strong>Main concerns:</strong> ${escapeHtml((analysis.main_concerns ?? []).join("; ") || "None supplied")}</p>
+          <p><strong>Alternatives:</strong> ${escapeHtml((analysis.alternative_recommendations ?? []).join("; ") || "None supplied")}</p>
           <p><strong>Facts:</strong> ${escapeHtml((analysis.facts ?? []).join("; ") || "None supplied")}</p>
           <p><strong>Assumptions:</strong> ${escapeHtml((analysis.assumptions ?? []).join("; ") || "None stated")}</p>
         </details>` : `<p class="hint">Analysis not yet recorded.</p>`}
-      ${discussion ? `
-        <details><summary>Discussion response</summary>
-          <p><strong>Challenges:</strong> ${escapeHtml(discussion.challenges)}</p>
-          <p><strong>Reconsideration:</strong> ${escapeHtml(discussion.reconsideration)}</p>
-          <p><strong>Updated recommendation:</strong> ${escapeHtml(discussion.updated_recommendation)}</p>
-          <p>${escapeHtml(discussion.reasoning)}</p>
-        </details>` : ""}
+      ${discussions.map((response) => `
+        <details ${response.round_number === currentRound ? "open" : ""}>
+          <summary>Round ${response.round_number} discussion · ${escapeHtml(response.updated_recommendation)} · ${Math.round(response.confidence * 100)}%</summary>
+          <p class="hint">${escapeHtml(responseTypeLabel(response.response_type))} · ${escapeHtml(response.provider)} / ${escapeHtml(response.model)} · ${escapeHtml(response.completed_at)}</p>
+          <p><strong>Agreement:</strong> ${escapeHtml(response.agreement)}</p>
+          <p><strong>Disagreement:</strong> ${escapeHtml(response.disagreement)}</p>
+          <p><strong>Weak reasoning:</strong> ${escapeHtml(response.weak_reasoning)}</p>
+          <p><strong>Missing information:</strong> ${escapeHtml(response.missing_information)}</p>
+          <p><strong>Possible risks:</strong> ${escapeHtml(response.possible_risks)}</p>
+          <p><strong>Challenges:</strong> ${escapeHtml(response.challenges)}</p>
+          <p><strong>Reconsideration:</strong> ${escapeHtml(response.reconsideration)}</p>
+          <p>${escapeHtml(response.reasoning)}</p>
+        </details>`).join("")}
     </article>`;
+}
+
+function lowConfidenceNotice(meeting) {
+  const lowConfidence = (meeting.analyses ?? [])
+    .filter((analysis) => analysis.confidence < 0.5)
+    .map((analysis) => `${seatName(analysis.agent_id)} initial analysis (${Math.round(analysis.confidence * 100)}%)`);
+  const latestByAgent = new Map();
+  for (const discussion of meeting.discussions ?? []) {
+    const prior = latestByAgent.get(discussion.agent_id);
+    if (!prior || prior.round_number < discussion.round_number) {
+      latestByAgent.set(discussion.agent_id, discussion);
+    }
+  }
+  for (const discussion of latestByAgent.values()) {
+    if (discussion.confidence < 0.5) {
+      lowConfidence.push(`${seatName(discussion.agent_id)} discussion (${Math.round(discussion.confidence * 100)}%)`);
+    }
+  }
+  return lowConfidence.length
+    ? `<p class="notice error"><strong>Low confidence for Commander review:</strong> ${escapeHtml(lowConfidence.join("; "))}</p>`
+    : "";
 }
 
 function renderVotes(meeting, agents, phase) {
@@ -364,10 +424,12 @@ function renderResult(meeting) {
 }
 
 function renderCouncilDecision(meeting) {
+  const confidenceNotice = lowConfidenceNotice(meeting);
   const decision = meeting.commander_decision;
   if (decision) {
     return `
       <div class="workflow-step">
+        ${confidenceNotice}
         <div class="phase-heading"><div><h3>Commander decision</h3>
           <p>${escapeHtml(decision.option)}</p></div>
           <span class="badge">${escapeHtml(decision.option)}</span>
@@ -381,6 +443,7 @@ function renderCouncilDecision(meeting) {
     : ["REJECT", "REQUEST_ANOTHER_MEETING"];
   return `
     <form class="workflow-step form-grid" data-form="commander-decision">
+      ${confidenceNotice}
       <h3>Commander decision</h3>
       <p class="hint">Authorization requires a council majority. This application records the decision; it does not issue game commands.</p>
       <label>Decision
@@ -399,13 +462,19 @@ function renderWorkflow() {
     return `<div class="empty-state">Select a meeting or create one to view its council workflow. Meetings are resumable after restarting the service.</div>`;
   }
   const analysisById = new Map((meeting.analyses ?? []).map((item) => [item.agent_id, item]));
-  const discussionById = new Map((meeting.discussions ?? []).map((item) => [item.agent_id, item]));
+  const discussionsByAgent = new Map();
+  for (const discussion of meeting.discussions ?? []) {
+    const responses = discussionsByAgent.get(discussion.agent_id) ?? [];
+    responses.push(discussion);
+    discussionsByAgent.set(discussion.agent_id, responses);
+  }
   const agentCards = state.agents.map((agent) =>
     renderAnalysisCard(
       agent,
       analysisById.get(agent.agent_id),
-      discussionById.get(agent.agent_id),
+      discussionsByAgent.get(agent.agent_id) ?? [],
       meeting.state,
+      meeting.discussion_round,
     ),
   ).join("");
   let phaseBody = "";
@@ -423,14 +492,37 @@ function renderWorkflow() {
         true,
       );
     } else {
-      const discussionCount = meeting.discussions?.length ?? 0;
-      phaseBody += `<p class="hint">${discussionCount} discussion response(s) recorded. Continue when ready.</p>`;
-      phaseBody += actionButton(
-        "Start manual voting",
-        "start-voting",
-        discussionCount < 1,
-        true,
+      const currentResponses = (meeting.discussions ?? []).filter(
+        (item) => item.round_number === meeting.discussion_round,
       );
+      const participants = meeting.analyses ?? [];
+      const missing = participants
+        .filter((analysis) => !currentResponses.some(
+          (response) => response.agent_id === analysis.agent_id,
+        ))
+        .map((analysis) => seatName(analysis.agent_id));
+      phaseBody += `<p class="hint">Discussion round ${meeting.discussion_round}/${meeting.max_discussion_rounds} · ${currentResponses.length}/${participants.length} participating agent responses recorded.</p>`;
+      phaseBody += missing.length
+        ? `<p class="notice">No response was invented. Waiting for: ${escapeHtml(missing.join(", "))}.</p>`
+        : "";
+      phaseBody += meeting.unresolved_disagreements?.length
+        ? `<div class="notice"><strong>Unresolved disagreements</strong>${listMarkup(meeting.unresolved_disagreements)}</div>`
+        : `<p class="hint">No unresolved disagreement has been reported yet.</p>`;
+      if (meeting.discussion_round < meeting.max_discussion_rounds) {
+        phaseBody += actionButton(
+          "Start next discussion round",
+          "next-discussion",
+          missing.length > 0,
+          true,
+        );
+      } else {
+        phaseBody += actionButton(
+          "Start manual voting",
+          "start-voting",
+          missing.length > 0,
+          true,
+        );
+      }
     }
   } else if (meeting.state === "INITIAL_VOTING") {
     phaseBody = `
@@ -481,7 +573,48 @@ function renderMeetingsPanel() {
     </section>`;
 }
 
+function renderHistoryPanel() {
+  if (!state.mission) return "";
+  const rows = state.historyResults.length
+    ? `<ul class="history-list">${state.historyResults.map((item) => `
+        <li class="history-item">
+          <strong>Historical · ${escapeHtml(item.occurred_at)}</strong>
+          <p>${escapeHtml(item.content)}</p>
+          <p class="hint">Source: ${escapeHtml(item.source)}</p>
+          <p class="notice">${escapeHtml(item.warning)}</p>
+        </li>`).join("")}</ul>`
+    : `<p class="hint">Search retrieves dated mission records and council memory. Historical threats are never treated as current.</p>`;
+  return `
+    <section class="panel">
+      <div class="section-heading"><h2>Search mission history</h2></div>
+      <form class="field-grid" data-form="history-search">
+        <label>Search decisions, observations, risks, orders, or disagreements
+          <input name="query" maxlength="256" required value="${escapeHtml(state.historyQuery)}">
+        </label>
+        <button type="submit" ${state.busy ? "disabled" : ""}>Search history</button>
+      </form>
+      <p class="hint">Matching records are explicitly provided to the council as historical context, with source and date. They are not current mission facts.</p>
+      ${rows}
+    </section>`;
+}
+
 function render() {
+  if (!state.authenticated) {
+    app.innerHTML = `
+      <main class="login-shell">
+        <form class="panel login-panel" data-form="login">
+          <p class="section-kicker">Local access required</p>
+          <h1>Operation AI Squad</h1>
+          <p class="muted">Enter the access token configured for this local service.</p>
+          ${state.error ? `<div class="notice error" role="alert">${escapeHtml(state.error)}</div>` : ""}
+          <label>Access token
+            <input name="token" type="password" autocomplete="current-password" required>
+          </label>
+          <button class="primary" type="submit" ${state.busy ? "disabled" : ""}>Unlock dashboard</button>
+        </form>
+      </main>`;
+    return;
+  }
   const connection = state.socketConnected
     ? `<span class="pill connected">Live updates connected</span>`
     : `<span class="pill">Live updates reconnecting</span>`;
@@ -496,6 +629,7 @@ function render() {
           <span class="pill simulation">Simulation only · no game connection</span>
           ${connection}
           ${renderProviderStatus()}
+          <button type="button" data-action="logout">Lock dashboard</button>
         </div>
       </header>
       ${state.error ? `<div class="notice error spacer-top" role="alert">${escapeHtml(state.error)}</div>` : ""}
@@ -506,6 +640,7 @@ function render() {
             ${renderMissionPanel()}
             ${renderProviderPanel()}
           </div>
+            ${renderHistoryPanel()}
           ${renderMeetingsPanel()}
           <div class="notice">Door Kickers 2 is not connected. Mission facts are operator-entered; this dashboard cannot read game state or issue in-game actions.</div>
         </main>
@@ -559,6 +694,8 @@ async function perform(task) {
 async function selectMission(missionId) {
   state.selectedMissionId = missionId;
   state.selectedMeetingId = null;
+  state.historyResults = [];
+  state.historyQuery = "";
   state.error = "";
   try {
     await loadWorkspace();
@@ -573,6 +710,16 @@ async function handleSubmit(form) {
   const value = (name) => String(data.get(name) ?? "");
   const json = (object) => JSON.stringify(object);
   switch (form.dataset.form) {
+    case "login": {
+      const session = await api("/api/auth/login", {
+        method: "POST",
+        body: json({ token: value("token") }),
+      });
+      state.csrfToken = session.csrf_token;
+      state.authenticated = true;
+      connectEvents();
+      break;
+    }
     case "create-mission": {
       const mission = await api("/api/missions", {
         method: "POST",
@@ -584,6 +731,8 @@ async function handleSubmit(form) {
       });
       state.selectedMissionId = mission.mission_id;
       state.selectedMeetingId = null;
+      state.historyResults = [];
+      state.historyQuery = "";
       break;
     }
     case "update-mission": {
@@ -609,6 +758,14 @@ async function handleSubmit(form) {
         { method: "POST", body: json({ motion: value("motion") }) },
       );
       state.selectedMeetingId = meeting.meeting_id;
+      break;
+    }
+    case "history-search": {
+      state.historyQuery = value("query").trim();
+      const result = await api(
+        `/api/missions/${encodeURIComponent(state.selectedMissionId)}/history/search?query=${encodeURIComponent(state.historyQuery)}`,
+      );
+      state.historyResults = result.results;
       break;
     }
     case "initial-vote":
@@ -651,16 +808,30 @@ async function handleAction(button) {
       state.selectedMeetingId = button.dataset.id;
       await perform(async () => {});
       return;
+    case "logout":
+      await api("/api/auth/logout", { method: "POST" });
+      state.authenticated = false;
+      state.csrfToken = "";
+      state.socket?.close();
+      state.error = "";
+      render();
+      return;
     case "run-analysis":
       await perform(() => api(`/api/meetings/${meetingId}/analysis`, {
         method: "POST",
-        body: JSON.stringify({ agent_id: button.dataset.agent }),
+        body: JSON.stringify({
+          agent_id: button.dataset.agent,
+          history_query: state.historyQuery || undefined,
+        }),
       }));
       return;
     case "run-discussion":
       await perform(() => api(`/api/meetings/${meetingId}/discussion`, {
         method: "POST",
-        body: JSON.stringify({ agent_id: button.dataset.agent }),
+        body: JSON.stringify({
+          agent_id: button.dataset.agent,
+          history_query: state.historyQuery || undefined,
+        }),
       }));
       return;
     case "start-analysis":
@@ -671,6 +842,9 @@ async function handleAction(button) {
       return;
     case "start-voting":
       await perform(() => api(`/api/meetings/${meetingId}/votes/start`, { method: "POST" }));
+      return;
+    case "next-discussion":
+      await perform(() => api(`/api/meetings/${meetingId}/discussion/next`, { method: "POST" }));
       return;
     case "start-revision":
       await perform(() => api(`/api/meetings/${meetingId}/revision/start`, { method: "POST" }));
@@ -698,8 +872,10 @@ app.addEventListener("click", (event) => {
 });
 
 function connectEvents() {
+  if (!state.authenticated) return;
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(`${protocol}//${window.location.host}/ws/events`);
+  state.socket = socket;
   socket.addEventListener("open", () => {
     state.socketConnected = true;
     render();
@@ -724,19 +900,40 @@ function connectEvents() {
   socket.addEventListener("close", () => {
     state.socketConnected = false;
     render();
-    window.setTimeout(connectEvents, 2500);
+    if (state.authenticated) window.setTimeout(connectEvents, 2500);
   });
   socket.addEventListener("error", () => socket.close());
 }
 
 async function start() {
   try {
+    const session = await api("/api/auth/session");
+    state.csrfToken = session.csrf_token;
+    state.authenticated = true;
     await loadWorkspace();
   } catch (error) {
-    state.error = error instanceof Error ? error.message : String(error);
+    if (!(error instanceof Error) || !error.message.includes("Authentication required")) {
+      state.error = error instanceof Error ? error.message : String(error);
+    }
   }
   render();
-  connectEvents();
+  if (state.authenticated) {
+    connectEvents();
+    window.setInterval(async () => {
+      try {
+        state.processing = await api("/api/processing");
+        const status = app.querySelector("#processing-status");
+        if (status) status.textContent = processingLabel();
+      } catch (error) {
+        if (error instanceof Error && error.message === "Authentication required") {
+          state.authenticated = false;
+          state.csrfToken = "";
+        }
+        state.error = error instanceof Error ? error.message : String(error);
+        render();
+      }
+    }, 1000);
+  }
 }
 
 void start();

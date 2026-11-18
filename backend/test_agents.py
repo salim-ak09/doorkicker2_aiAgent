@@ -2,7 +2,7 @@ import json
 import unittest
 
 from backend.agents import CouncilAgent
-from backend.council import AgentAnalysis, CouncilMeeting
+from backend.council import AgentAnalysis, AgentDiscussion, CouncilMeeting
 from backend.mission_state import MissionState
 from backend.providers import (
     InvalidProviderResponseError,
@@ -23,13 +23,16 @@ class FakeProvider:
         return self.responses.pop(0)
 
 
-def analysis_response(recommendation: str = "Proceed cautiously") -> str:
+def analysis_response(recommendation: str = "YES") -> str:
     return json.dumps(
         {
             "recommendation": recommendation,
             "reasoning": "This follows from the supplied mission facts.",
             "facts": ["The objective appears in the supplied mission snapshot."],
             "assumptions": ["The mission snapshot is current."],
+            "supporting_evidence": ["The objective appears in the snapshot."],
+            "main_concerns": ["Current conditions are unknown."],
+            "alternative_recommendations": ["Delay pending updated information."],
             "main_risks": "The route may be obstructed.",
             "missing_information": "Current visibility is unknown.",
             "suggested_improvements": "Request an updated observation.",
@@ -38,15 +41,21 @@ def analysis_response(recommendation: str = "Proceed cautiously") -> str:
     )
 
 
-def discussion_response() -> str:
+def discussion_response(recommendation_changed: bool = True) -> str:
     return json.dumps(
         {
+            "agreement": "Both analyses identify the same objective.",
+            "disagreement": "The level of caution differs.",
+            "weak_reasoning": "No major weakness identified.",
+            "missing_information": "Current visibility.",
+            "possible_risks": "Conditions may have changed.",
             "challenges": "The advisor notes that visibility is unconfirmed.",
             "reconsideration": "That uncertainty warrants additional caution.",
-            "recommendation_changed": True,
-            "updated_recommendation": "Wait for a current observation.",
+            "recommendation_changed": recommendation_changed,
+            "updated_recommendation": "NO",
             "reasoning": "The peer analysis identifies a material unknown.",
             "confidence": 0.8,
+            "unresolved_disagreements": ["Whether to proceed without current visibility."],
         }
     )
 
@@ -74,7 +83,7 @@ class CouncilAgentTests(unittest.TestCase):
         self.mission.update_objective("Updated after meeting creation")
         analysis = self.agent.analyze(self.meeting)
 
-        self.assertEqual(analysis.recommendation, "Proceed cautiously")
+        self.assertEqual(analysis.recommendation, "YES")
         self.assertEqual(self.meeting.analyses["squad_leader"], analysis)
         self.assertEqual(len(self.provider.calls), 1)
         system_prompt, user_prompt = self.provider.calls[0]
@@ -90,7 +99,7 @@ class CouncilAgentTests(unittest.TestCase):
         self.agent.analyze(self.meeting)
         peer_analysis = AgentAnalysis(
             agent_id="tactical_advisor",
-            recommendation="Wait for updated visibility",
+            recommendation="NO",
             reasoning="Visibility has not been confirmed.",
             facts=("Visibility is not stated in the snapshot.",),
             assumptions=(),
@@ -106,7 +115,7 @@ class CouncilAgentTests(unittest.TestCase):
 
         self.assertTrue(discussion.recommendation_changed)
         self.assertEqual(
-            self.meeting.discussions["squad_leader"],
+            self.meeting.discussions[(1, "squad_leader")],
             discussion,
         )
         discussion_request = json.loads(self.provider.calls[1][1])
@@ -122,6 +131,50 @@ class CouncilAgentTests(unittest.TestCase):
         )
         self.assertEqual(len(self.provider.calls), 2)
 
+    def test_later_round_receives_actual_peer_counterarguments(self) -> None:
+        self.provider.responses.extend(
+            (discussion_response(), discussion_response(False))
+        )
+        self.agent.analyze(self.meeting)
+        self.meeting.submit_analysis(
+            AgentAnalysis(
+                agent_id="tactical_advisor",
+                recommendation="NO",
+                reasoning="The route has an unresolved risk.",
+                facts=("A risk is listed.",),
+                assumptions=(),
+                main_risks="Route conditions may change.",
+                missing_information="Current conditions.",
+                suggested_improvements="Wait for confirmation.",
+                confidence=0.8,
+            )
+        )
+        self.meeting.start_discussion()
+        self.agent.discuss(self.meeting)
+        self.meeting.submit_discussion(
+            AgentDiscussion(
+                agent_id="tactical_advisor",
+                challenges="The initial YES recommendation lacks current conditions.",
+                reconsideration="The NO recommendation remains.",
+                recommendation_changed=False,
+                updated_recommendation="NO",
+                reasoning="The mission snapshot confirms the missing information.",
+                confidence=0.8,
+            )
+        )
+        self.meeting.start_next_discussion_round()
+
+        self.agent.discuss(self.meeting)
+
+        round_two_request = json.loads(self.provider.calls[2][1])
+        self.assertEqual(round_two_request["round_number"], 2)
+        self.assertEqual(
+            round_two_request["other_agents_previous_round_discussions"][
+                "tactical_advisor"
+            ]["updated_recommendation"],
+            "NO",
+        )
+
     def test_malformed_provider_output_is_not_recorded_as_analysis(self) -> None:
         self.provider.responses[0] = "not valid JSON"
 
@@ -133,7 +186,7 @@ class CouncilAgentTests(unittest.TestCase):
     def test_analysis_requires_the_complete_response_schema(self) -> None:
         self.provider.responses[0] = json.dumps(
             {
-                "recommendation": "Proceed",
+                "recommendation": "YES",
                 "reasoning": "Based on the available information.",
                 "main_risks": "Visibility is unknown.",
                 "missing_information": "Current visibility.",
@@ -148,10 +201,9 @@ class CouncilAgentTests(unittest.TestCase):
 
     def test_discussion_requires_peer_analysis(self) -> None:
         self.agent.analyze(self.meeting)
-        self.meeting.start_discussion()
 
-        with self.assertRaisesRegex(ValueError, "another agent"):
-            self.agent.discuss(self.meeting)
+        with self.assertRaisesRegex(RuntimeError, "at least two"):
+            self.meeting.start_discussion()
         self.assertEqual(len(self.provider.calls), 1)
 
     def test_agent_status_is_reported_by_its_configured_provider(self) -> None:

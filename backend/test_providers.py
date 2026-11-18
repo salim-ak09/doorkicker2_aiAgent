@@ -5,6 +5,7 @@ from io import BytesIO
 from urllib.error import HTTPError, URLError
 from unittest.mock import patch
 
+from backend.api import _ollama_provider_factory
 from backend.providers import (
     InvalidProviderResponseError,
     ModelUnavailableError,
@@ -170,3 +171,12 @@ class OllamaProviderTests(unittest.TestCase):
             OllamaProvider(base_url="http://localhost:invalid")
         with self.assertRaises(ValueError):
             self.provider.generate(" ", "User")
+
+    def test_api_provider_timeout_is_configurable(self) -> None:
+        with patch.dict("os.environ", {"OLLAMA_TIMEOUT_SECONDS": "7.5"}):
+            provider = _ollama_provider_factory()("squad_leader")
+        self.assertEqual(provider.timeout, 7.5)
+
+        with patch.dict("os.environ", {"OLLAMA_TIMEOUT_SECONDS": "invalid"}):
+            with self.assertRaisesRegex(RuntimeError, "OLLAMA_TIMEOUT_SECONDS"):
+                _ollama_provider_factory()
