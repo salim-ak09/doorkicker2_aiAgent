@@ -6,6 +6,7 @@ const state = {
   busy: false,
   csrfToken: "",
   error: "",
+  gameStatus: { status: "unknown", running: null, detail: "Not checked yet." },
   historyQuery: "",
   historyResults: [],
   meeting: null,
@@ -122,6 +123,46 @@ function renderProviderStatus() {
     <span class="pill ${providerClass}" title="${escapeHtml(
       state.providers.map((provider) => `${provider.provider} ${provider.model}: ${provider.detail}`).join("; "),
     )}">${providerLabel}</span>`;
+}
+
+function gameStatusPresentation() {
+  if (state.gameStatus.status === "process_detected_only") {
+    const processId = state.gameStatus.process_id;
+    return {
+      label: processId ? `GAME RUNNING · PID ${processId}` : "GAME RUNNING",
+      className: "connected",
+    };
+  }
+  if (state.gameStatus.status === "game_not_running") {
+    return { label: "GAME STOPPED", className: "simulation" };
+  }
+  return { label: "GAME STATUS UNKNOWN", className: "" };
+}
+
+function renderGameStatus() {
+  const presentation = gameStatusPresentation();
+  return `<span id="game-status" class="pill ${presentation.className}" title="${escapeHtml(
+    state.gameStatus.detail,
+  )}">${presentation.label}</span>`;
+}
+
+async function refreshGameStatus() {
+  try {
+    state.gameStatus = await api("/api/game/status");
+  } catch (error) {
+    state.gameStatus = {
+      status: "unknown",
+      running: null,
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+  const element = app.querySelector("#game-status");
+  if (element) {
+    const presentation = gameStatusPresentation();
+    element.className = `pill ${presentation.className}`;
+    element.textContent = presentation.label;
+    element.title = state.gameStatus.detail;
+  }
 }
 
 function renderMissionSidebar() {
@@ -626,7 +667,8 @@ function render() {
           <div><h1>Operation AI Squad</h1><p>Local mission planning console</p></div>
         </div>
         <div class="topbar-status">
-          <span class="pill simulation">Simulation only · no game connection</span>
+          ${renderGameStatus()}
+          <span class="pill simulation">Mission data · operator-entered</span>
           ${connection}
           ${renderProviderStatus()}
           <button type="button" data-action="logout">Lock dashboard</button>
@@ -642,7 +684,7 @@ function render() {
           </div>
             ${renderHistoryPanel()}
           ${renderMeetingsPanel()}
-          <div class="notice">Door Kickers 2 is not connected. Mission facts are operator-entered; this dashboard cannot read game state or issue in-game actions.</div>
+            <div class="notice">Game detection checks only whether DoorKickers2.exe is running. It does not read the mission name, map, units, enemies, hostages, objectives, or game state. Enter mission facts manually; this dashboard cannot issue in-game actions.</div>
         </main>
       </div>
     </div>`;
@@ -919,6 +961,8 @@ async function start() {
   render();
   if (state.authenticated) {
     connectEvents();
+    void refreshGameStatus();
+    window.setInterval(() => void refreshGameStatus(), 5000);
     window.setInterval(async () => {
       try {
         state.processing = await api("/api/processing");

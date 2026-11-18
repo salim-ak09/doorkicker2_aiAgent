@@ -33,6 +33,7 @@ from backend.council import (
     MeetingState,
     VoteChoice,
 )
+from backend.game_bridge import GameBridge, GameStatus, WindowsProcessGameBridge
 from backend.mission_state import MissionState, MissionStatus, Operator
 from backend.providers import (
     AIProvider,
@@ -182,6 +183,7 @@ def create_app(
     database_path: str | Path | None = None,
     provider_factory: Callable[[str], AIProvider] | None = None,
     access_token: str | None = None,
+    game_bridge: GameBridge | None = None,
 ) -> FastAPI:
     resolved_database_path = database_path or os.environ.get(
         "AI_SQUAD_DB_PATH", "ai_squad.sqlite3"
@@ -205,6 +207,9 @@ def create_app(
         store = SQLiteStore(resolved_database_path)
         provider_maker = provider_factory or _ollama_provider_factory()
         app.state.store = store
+        app.state.game_bridge = (
+            game_bridge if game_bridge is not None else WindowsProcessGameBridge()
+        )
         app.state.lock = asyncio.Lock()
         app.state.event_hub = EventHub()
         app.state.missions = {}
@@ -320,6 +325,10 @@ def create_app(
     @app.get("/api/status")
     async def application_status() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/api/game/status")
+    async def game_process_status(request: Request) -> GameStatus:
+        return await run_in_threadpool(request.app.state.game_bridge.get_status)
 
     @app.get("/api/agents")
     async def council_agents() -> dict[str, object]:

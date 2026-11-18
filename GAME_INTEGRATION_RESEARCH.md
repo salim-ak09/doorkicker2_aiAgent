@@ -29,7 +29,11 @@ The modloader was **not downloaded, installed, or tested**. No DLL was installed
 
 **Do not implement live game-state reads or gameplay commands at this stage.** An official, documented programmatic interface was not found in the sources reviewed. Community code-loading mechanisms do not meet the project's verification and safety requirements.
 
-Continue in clearly labeled simulation mode. Revisit a read-only or control bridge only if KillHouse publishes a supported interface or a separately reviewed, versioned protocol can be validated without modifying game files or relying on unverified DLLs. Until then, the application must not claim a game connection or actual in-game control.
+The application separately performs a read-only Windows process-list check for `DoorKickers2.exe` and can report whether that process is running, its PID, and when it stops. This check does not inspect process memory or game files and does not provide mission information. A modular `GameBridge` contract is available for a future supported reader; the live bridge always returns `mission_data_available: false` and `mission: null`. The dashboard continues to label mission information as operator-entered; it does not claim a game-state connection or actual in-game control.
+
+`backend/fixtures/mock_game_status.json` is explicitly labeled mock data for development and tests only. It is not loaded by the live application and contains no purported mission telemetry.
+
+Revisit mission-state reading only if KillHouse publishes a supported interface or a documented export format can be validated without modifying game files or relying on unverified DLLs. Until then, mission details must remain operator-entered.
 
 ## Sources
 

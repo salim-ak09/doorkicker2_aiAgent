@@ -2,7 +2,7 @@
 
 Operation AI Squad is a local-first mission-planning and AI council application. It has a FastAPI backend, a responsive browser dashboard, SQLite persistence, and an Ollama-backed analysis/discussion flow.
 
-**Door Kickers 2 is not connected.** There is no supported game-state reader or in-game command interface in this project. Mission information is entered by the operator and the dashboard is clearly marked simulation-only. See [GAME_INTEGRATION_RESEARCH.md](./GAME_INTEGRATION_RESEARCH.md).
+The app can detect whether `DoorKickers2.exe` is running on Windows, but this is only process detection, not a game connection. There is no supported mission-state reader or in-game command interface in this project. Mission information is entered by the operator and labeled as such. See [GAME_INTEGRATION_RESEARCH.md](./GAME_INTEGRATION_RESEARCH.md).
 
 ## Features
 
@@ -16,6 +16,8 @@ Operation AI Squad is a local-first mission-planning and AI council application.
 - Calculate a majority result, show missing voters without fabricating votes, and record a commander decision.
 - Resume in-progress meetings after restarting the service, including an interrupted discussion round.
 - View provider/model availability, request failures, and CPU-inference processing status; inference requests are serialized.
+- See a five-second, read-only Windows process check for `DoorKickers2.exe`, including its PID, clearly separate from mission-state detection.
+- Use a modular `GameBridge` contract for future supported readers. The live Windows bridge always reports mission data unavailable; `backend/fixtures/mock_game_status.json` is a clearly labeled development/test fixture and is never used as live telemetry.
 - Protect local access with a configured token, authenticated HTTP-only session cookie, CSRF/origin checks, and authenticated WebSocket connections. Requests from non-loopback clients are rejected.
 - Browse the interactive API reference at `/docs`.
 
@@ -23,7 +25,7 @@ Operation AI Squad is a local-first mission-planning and AI council application.
 
 - Python 3.10 or later (the current project was tested with Python 3.14).
 - Ollama running locally with the configured model for live AI analysis. The default is `qwen2.5:3b`.
-- Door Kickers 2 is not required to run this application.
+- Door Kickers 2 is not required to run this application. Process detection is available only on Windows.
 
 ## Quick start (Windows PowerShell)
 
@@ -66,7 +68,7 @@ $env:OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 Start the application bound to the local computer:
 
 ```powershell
-python -m uvicorn backend.api:app --host 127.0.0.1 --port 8000
+.\.venv\Scripts\python.exe -m uvicorn backend.api:app --host 127.0.0.1 --port 8000
 ```
 
 Open [http://127.0.0.1:8000](http://127.0.0.1:8000) for the dashboard or [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) for the API reference.
@@ -96,6 +98,7 @@ Meetings and mission updates are persisted as they are made and can be continued
 | Route | Purpose |
 | --- | --- |
 | `GET /api/status` | Service health |
+| `GET /api/game/status` | Read-only game process status; mission data remains unavailable |
 | `GET /api/agents` | Council seats and roles |
 | `GET /api/providers` | Provider status by agent |
 | `POST /api/auth/login` | Exchange the configured access token for a local session |

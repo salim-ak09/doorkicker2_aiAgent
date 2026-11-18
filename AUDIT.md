@@ -28,6 +28,7 @@ The original application features above remain implemented. Mission 3 improvemen
 - Mission snapshots, meeting records, discussion, and vote history have append-only protections against normal application-level edits. Commander authorization remains required.
 - Local access requires an access token; the server defaults to and enforces loopback access. State-changing requests use authenticated same-origin/CSRF checks, and WebSockets are authenticated.
 - Model requests are serialized and timeout-configurable. Provider failures, malformed responses, and interrupted work do not create fabricated answers.
+- On Windows, the dashboard checks whether `DoorKickers2.exe` is running and periodically detects when it stops. A modular `GameBridge` contract and clearly labeled development fixture exist, but actual game-state data remains unavailable and operator-entered.
 
 The browser dashboard is served at `/`; it supports mission editing, provider status, council progression, manual vote recording, Commander decisions, history search, and live updates. Votes are operator-entered. The AI does not cast votes or issue orders. Setup and configuration details are in [README.md](./README.md); the implementation summary is in [MISSION_3_REPORT.md](./MISSION_3_REPORT.md).
 
@@ -35,8 +36,8 @@ Automated provider tests use controlled responses. Local live Ollama and browser
 
 Game research found no official, documented external state or command interface in the reviewed sources. The dashboard therefore remains simulation-only, no game files were changed, and no game control is implemented. See [GAME_INTEGRATION_RESEARCH.md](./GAME_INTEGRATION_RESEARCH.md) for cited findings.
 
-Final Mission 3 validation: **60 tests passed**. Backend compilation, dashboard JavaScript syntax, and `git diff --check` passed. A browser smoke check verified login, dashboard rendering, shared-model disclosure, and WebSocket status. No failures remained in the final test run.
+Mission 3 validation passed **60 tests**. The subsequent Windows process detector and `GameBridge` update were validated with a complete suite of **65 passing tests**; backend compilation, dashboard JavaScript syntax, and `git diff --check` passed. No failures remained in the latest test run.
 
 ## Remaining work and limitations
 
-No items remain in the original implementation sequence. Audit protections are not cryptographic tamper-proofing against a host user who can directly alter the SQLite database or its triggers. The three default roles share one Ollama model. Actual game integration/control is intentionally out of scope. See [MISSION_3_REPORT.md](./MISSION_3_REPORT.md) for known limitations and the recommended next milestone.
+No items remain in the original implementation sequence. Audit protections are not cryptographic tamper-proofing against a host user who can directly alter the SQLite database or its triggers. The three default roles share one Ollama model. Actual mission-state reading and game control remain unavailable until a supported, verifiable interface exists. See [GAME_INTEGRATION_RESEARCH.md](./GAME_INTEGRATION_RESEARCH.md) and [MISSION_3_REPORT.md](./MISSION_3_REPORT.md) for limitations and the recommended next milestone.

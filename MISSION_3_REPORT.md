@@ -44,7 +44,7 @@ None in the final test run.
 - The three default council roles use distinct role prompts but share one Ollama model; they are not independent models.
 - AI inference requires a running Ollama service and an installed configured model. Unavailable providers and invalid responses are reported rather than replaced with fabricated answers.
 - Audit protections prevent ordinary application-level mutation but are not cryptographic tamper-proofing against a host user who can directly alter the SQLite database or its triggers.
-- Door Kickers 2 integration and control are not implemented; mission state remains simulated/operator-provided.
+- Windows process presence can be detected, but actual mission-state reading and game control are not implemented; mission state remains simulated/operator-provided.
 
 ## Recommended next milestone
 

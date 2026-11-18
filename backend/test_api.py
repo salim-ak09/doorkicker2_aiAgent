@@ -19,11 +19,12 @@ from backend.providers import (
 ACCESS_TOKEN = "test-access-token"
 
 
-def create_test_app(database_path, provider_factory):
+def create_test_app(database_path, provider_factory, game_bridge=None):
     return create_app(
         database_path,
         provider_factory=provider_factory,
         access_token=ACCESS_TOKEN,
+        game_bridge=game_bridge,
     )
 
 
@@ -102,6 +103,20 @@ class OfflineProvider:
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
         raise ProviderUnavailableError("Ollama endpoint is unavailable")
+
+
+class FakeGameBridge:
+    def get_status(self) -> dict[str, object]:
+        return {
+            "source": "windows_process_detection",
+            "game": "Door Kickers 2",
+            "running": True,
+            "process_id": 1234,
+            "mission_data_available": False,
+            "mission": None,
+            "status": "process_detected_only",
+            "detail": "DoorKickers2.exe is running. Mission data is not available.",
+        }
 
 
 class FailingProvider:
@@ -230,6 +245,7 @@ class ApiTests(unittest.TestCase):
         app = create_test_app(
             self.database_path,
             lambda agent_id: FakeProvider(agent_id),
+            game_bridge=FakeGameBridge(),
         )
         with authenticated_client(app) as client:
             self.assertEqual(client.get("/api/status").json(), {"status": "ok"})
@@ -247,6 +263,12 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(
                 client.get("/api/providers/unknown/status").status_code, 404
             )
+
+            game_status = client.get("/api/game/status")
+            self.assertEqual(game_status.status_code, 200)
+            self.assertEqual(game_status.json()["status"], "process_detected_only")
+            self.assertFalse(game_status.json()["mission_data_available"])
+            self.assertIsNone(game_status.json()["mission"])
 
             created = client.post(
                 "/api/missions",

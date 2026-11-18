@@ -1,0 +1,10 @@
+{
+  "notice": "MOCK DATA FOR DEVELOPMENT AND TESTING ONLY. NOT LIVE GAME TELEMETRY.",
+  "source": "development_mock_fixture",
+  "game": "Door Kickers 2",
+  "running": true,
+  "process_id": 1234,
+  "mission_data_available": false,
+  "mission": null,
+  "status": "mock_only"
+}
